@@ -115,6 +115,11 @@ class Request:
         # indicates that the output is corrupted
         self.num_nans_in_logits = 0
 
+        # GPU/CPU overlap: delay_max_output_token_len indicates the max number
+        # of output tokens that will be added from the previous step's output
+        # This is used by scheduler to reserve space during scheduling
+        self.delay_max_output_token_len = 0
+
         self.block_hashes: list[BlockHash] = []
         self.get_hash_new_full_blocks: Optional[Callable[
             [], list[BlockHash]]] = None
@@ -171,7 +176,7 @@ class Request:
 
     @property
     def num_tokens_with_spec(self) -> int:
-        return len(self._all_token_ids) + len(self.spec_token_ids)
+        return len(self._all_token_ids) + len(self.spec_token_ids) + self.delay_max_output_token_len
 
     @property
     def num_output_tokens(self) -> int:

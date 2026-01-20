@@ -128,7 +128,11 @@ class ModelRunnerOutput:
     # req_id -> num_nans_in_logits
     num_nans_in_logits: Optional[dict[str, int]] = None
 
+    # GPU/CPU overlap: delayed max output token lens for next step processing
+    # req_id -> max_output_token_len (used in overlap mode)
+    delay_max_output_token_lens: Optional[dict[str, int]] = None
 
+    
 # ModelRunnerOutput wrapper for async scheduling.
 class AsyncModelRunnerOutput(ABC):
 

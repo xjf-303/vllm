@@ -649,6 +649,64 @@ class ChatCompletionRequest(OpenAIBaseModel):
                      "numeric values, used by custom extensions."),
     )
 
+        # --8<-- [start:youtuvl-extra-params]
+    # YoutuVL document parsing extension parameters
+    youtuvl_mode: Optional[Literal["chat", "layout", "ocr", "document"]] = Field(
+        default=None,
+        description=(
+            "YoutuVL document parsing mode. "
+            "'chat': normal conversation (default), "
+            "'layout': detect layout elements only, "
+            "'ocr': OCR recognition for specified regions, "
+            "'document': full two-stage document parsing (layout + OCR)."),
+    )
+    parse_mode: Optional[str] = Field(
+        default="sequential",
+        description=(
+            "Document parsing strategy. "
+            "'sequential': Layout then OCR (default), "
+            "'streaming': OCR starts during layout generation, "
+            "'single_pass': Layout + all OCR in multi-turn (fastest, uses KV cache)."),
+    )
+    ocr_batch_size: Optional[int] = Field(
+        default=1,
+        description=(
+            "Batch size for OCR recognition in document mode. "
+            "Default 1 is most stable. Values > 2 may cause incorrect results "
+            "due to model not generating enough <sep> separators."),
+    )
+    ocr_concurrency: Optional[int] = Field(
+        default=None,
+        description="Max concurrent OCR requests. None means all batches run in parallel.",
+    )
+    skip_ocr_types: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "Layout types to skip OCR (will use placeholder text). "
+            "Default: LAYOUT_FIGURE, LAYOUT_CHART, LAYOUT_SEAL. "
+            "Set to empty list [] to OCR all types."),
+    )
+    layout_types: Optional[list[str]] = Field(
+        default=None,
+        description=(
+            "Filter layout types to process. "
+            "Options: LAYOUT_TEXT, LAYOUT_TABLE, LAYOUT_FIGURE, LAYOUT_FORMULA, "
+            "LAYOUT_TITLE, LAYOUT_HEADER, LAYOUT_FOOTER, LAYOUT_CODE, LAYOUT_CAPTION."),
+    )
+    streaming_layout: Optional[bool] = Field(
+        default=False,
+        description=(
+            "[Deprecated] Use parse_mode='streaming' instead. "
+            "Enable streaming layout parsing."),
+    )
+    regions: Optional[list[dict[str, Any]]] = Field(
+        default=None,
+        description=(
+            "Regions for OCR mode. Each region should have 'type' and 'bbox' fields. "
+            "Example: [{'type': 'LAYOUT_TEXT', 'bbox': [x1, y1, x2, y2]}]"),
+    )
+    # --8<-- [end:youtuvl-extra-params]
+
     # --8<-- [end:chat-completion-extra-params]
 
     # Default sampling parameters for chat completion requests

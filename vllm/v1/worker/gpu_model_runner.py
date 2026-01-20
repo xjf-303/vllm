@@ -86,8 +86,9 @@ from vllm.v1.kv_cache_interface import (AttentionSpec,
                                         UniformTypeKVCacheSpecs)
 # yapf: enable
 from vllm.v1.outputs import (EMPTY_MODEL_RUNNER_OUTPUT, AsyncModelRunnerOutput,
-                             DraftTokenIds, LogprobsLists, LogprobsTensors,
-                             ModelRunnerOutput, PoolerOutput, SamplerOutput)
+                             DraftTokenIds, KVConnectorOutput, LogprobsLists,
+                             LogprobsTensors, ModelRunnerOutput, PoolerOutput,
+                             SamplerOutput)
 from vllm.v1.pool.metadata import PoolingMetadata
 from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -329,6 +330,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.async_output_copy_stream = torch.cuda.Stream() if \
             self.use_async_scheduling else None
 
+        # Dedicated copy stream for CPU/GPU overlap mode.
+        # NOTE: Do NOT reuse the default stream, otherwise GPU->CPU copies can
+        # land on the critical path and slow down generation.
+        self.overlap_output_copy_stream = torch.cuda.Stream()
+
         # TODO(woosuk): Provide an option to tune the max cudagraph batch size.
         # The convention is different.
         # self.cudagraph_batch_sizes sorts in ascending order.
@@ -440,6 +446,23 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             dtype=torch.int64,
             device="cpu",
             pin_memory=self.pin_memory)
+
+        # GPU/CPU overlap state - use double buffering to avoid overwriting
+        self._prev_output: Optional[dict] = None
+        self._overlap_sync_event: Optional[torch.cuda.Event] = None
+        self._overlap_buffer_idx = 0  # Toggle between 0 and 1
+        self._overlap_pinned_buffers = [
+            torch.empty(
+                (self.max_model_len, 1),
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=self.pin_memory),
+            torch.empty(
+                (self.max_model_len, 1),
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=self.pin_memory),
+        ]
 
     def _make_buffer(self,
                      *size: Union[int, torch.SymInt],
@@ -2212,6 +2235,102 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             invalid_req_indices,
         )
 
+        def _bookkeeping_overlap(
+            self,
+            scheduler_output: "SchedulerOutput",
+            sampler_output: SamplerOutput,
+            logits: Optional[torch.Tensor],
+            hidden_states: torch.Tensor,
+            num_scheduled_tokens: int,
+            kv_connector_output: Optional["KVConnectorOutput"],
+            max_query_len: int,
+        ) -> None:
+            """Bookkeeping for GPU/CPU overlap mode.
+
+            Key idea:
+            - Don't block the next step's input preparation on CPU-side token_ids
+            updates. Instead, reuse vLLM's existing GPU cache path
+            (input_batch.prev_sampled_token_ids) so the next step can patch the
+            last decode token directly on GPU.
+
+            This method:
+            1. Starts async GPU->CPU transfer for *current* step's sampled tokens
+            (on a dedicated stream).
+            2. Caches the last sampled token on GPU for next step input patching.
+            3. Stores info for next step's scheduler update.
+            """
+            num_nans_in_logits = {}
+            if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
+                num_nans_in_logits = self._get_nans_in_logits(logits)
+
+            discard_sampled_tokens_req_indices = \
+                self.discard_request_indices.np[:self.num_discarded_requests]
+            for i in discard_sampled_tokens_req_indices:
+                gen = self.input_batch.generators.get(int(i))
+                if gen is not None:
+                    gen.set_offset(gen.get_offset() - 4)
+
+            # Copy some objects so they don't get modified after returning
+            req_ids_output_copy = self.input_batch.req_ids.copy()
+            req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
+
+            # Get logprobs (this may involve GPU->CPU sync, but it's usually small)
+            logprobs_tensors = sampler_output.logprobs_tensors
+            logprobs_lists = logprobs_tensors.tolists() \
+                if logprobs_tensors is not None else None
+
+            # Compute prompt logprobs if needed
+            prompt_logprobs_dict = self._get_prompt_logprobs_dict(
+                hidden_states[:num_scheduled_tokens],
+                scheduler_output.num_scheduled_tokens,
+            )
+
+            sampled_token_ids = sampler_output.sampled_token_ids
+
+            # Cache the last sampled token on GPU so the next step can patch the
+            # last token into input_ids without depending on CPU-side token_ids_cpu.
+            # We always keep the tensor shape as (N, 1) so `_prepare_input_ids()` can
+            # read column 0.
+            invalid_req_indices_set = set(discard_sampled_tokens_req_indices.tolist())
+            self.input_batch.prev_sampled_token_ids = sampled_token_ids[:, -1:].contiguous()
+            self.input_batch.prev_sampled_token_ids_invalid_indices = invalid_req_indices_set
+            self.input_batch.prev_req_id_to_index = {
+                req_id: i
+                for i, req_id in enumerate(self.input_batch.req_ids)
+                if i not in invalid_req_indices_set
+            }
+
+            # Start async GPU->CPU transfer for sampled tokens using double buffering.
+            # Use a dedicated stream to avoid blocking the default compute stream.
+            current_buffer_idx = self._overlap_buffer_idx
+            self._overlap_buffer_idx = 1 - self._overlap_buffer_idx  # Toggle for next step
+
+            pinned = self._overlap_pinned_buffers[current_buffer_idx][:sampled_token_ids.shape[0]]
+
+            default_stream = torch.cuda.current_stream()
+            copy_stream = self.overlap_output_copy_stream
+            with torch.cuda.stream(copy_stream):
+                copy_stream.wait_stream(default_stream)
+                pinned.copy_(sampled_token_ids, non_blocking=True)
+                sync_event = torch.cuda.Event()
+                sync_event.record()
+
+            sampled_token_ids_cpu = pinned
+
+            # Store current output for next step processing.
+            self._prev_output = {
+                "req_ids": req_ids_output_copy,
+                "req_id_to_index": req_id_to_index_output_copy,
+                "sampled_token_ids_cpu": sampled_token_ids_cpu,
+                "logprobs_lists": logprobs_lists,
+                "prompt_logprobs_dict": prompt_logprobs_dict,
+                "pooler_output": [],
+                "num_nans_in_logits": num_nans_in_logits,
+                "kv_connector_output": kv_connector_output,
+                "discard_indices": discard_sampled_tokens_req_indices.tolist(),
+            }
+            self._overlap_sync_event = sync_event
+
     @contextmanager
     def synchronize_input_prep(self):
         if self.prepare_inputs_event is None:
@@ -2239,6 +2358,12 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 self._update_states(scheduler_output)
 
                 if not scheduler_output.total_num_scheduled_tokens:
+                    # No forward this step. In overlap mode we may still need to
+                    # drain the deferred output from the previous step.
+                    if (envs.VLLM_CPU_GPU_OVERLAP and not self.use_async_scheduling
+                            and not has_kv_transfer_group()):
+                        return self.prepare_prev_output()
+
                     if not has_kv_transfer_group():
                         # Return empty ModelRunnerOutput if no work to do.
                         return EMPTY_MODEL_RUNNER_OUTPUT
@@ -2401,6 +2526,41 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # as inputs, and does not need to wait for bookkeeping to finish.
             propose_draft_token_ids(sampler_output.sampled_token_ids)
 
+        # GPU/CPU Overlap mode:
+        # 1. Wait for prev D2H (overlapped with schedule + prepare_inputs + forward)
+        # 2. Start async D2H for current step
+        # 3. Return PREVIOUS step's output
+        if envs.VLLM_CPU_GPU_OVERLAP and not self.use_async_scheduling:
+            # Process previous step's output AFTER sample completes.
+            # This maximizes the overlap window: the GPU->CPU transfer from the
+            # previous step overlaps with schedule + _prepare_inputs + Forward.
+            with record_function_or_nullcontext("ProcessPrevOutput"):
+                prev_output_for_return = self._process_prev_output_overlap()
+
+            with record_function_or_nullcontext("Bookkeep_Overlap"):
+                self._bookkeeping_overlap(
+                    scheduler_output, sampler_output, logits,
+                    hidden_states, num_scheduled_tokens, kv_connector_output,
+                    max_query_len)
+
+            if (self.speculative_config and not use_padded_batch_for_eagle
+                    and input_fits_in_drafter):
+                # For ngram, we need the CPU tokens from previous step.
+                if (prev_output_for_return
+                        and prev_output_for_return.sampled_token_ids):
+                    propose_draft_token_ids(
+                        prev_output_for_return.sampled_token_ids)
+
+            with record_function_or_nullcontext("EPLB"):
+                self.eplb_step()
+
+            # Return the PREVIOUS step's output.
+            # If no previous output (first step), return empty.
+            if prev_output_for_return is not None:
+                return prev_output_for_return
+            return EMPTY_MODEL_RUNNER_OUTPUT
+
+        # Standard synchronous bookkeeping path
         with record_function_or_nullcontext("Bookkeep"):
             (
                 num_nans_in_logits,
@@ -4158,3 +4318,171 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.transfer_event.record()
         self.transfer_event.synchronize()
         return pinned.tolist()
+
+    def _to_list_async(self, sampled_token_ids: torch.Tensor) -> torch.Tensor:
+        """Async version of _to_list for GPU/CPU overlap mode.
+        
+        Returns the pinned CPU tensor without synchronization.
+        The caller must synchronize before using the data.
+        """
+        pinned = self.sampled_token_ids_pinned_cpu[:sampled_token_ids.shape[0]]
+        pinned.copy_(sampled_token_ids, non_blocking=True)
+        return pinned
+
+    def _process_prev_output_overlap(self) -> Optional[ModelRunnerOutput]:
+        """Process the previous step's output after current step's forward.
+
+        The GPU->CPU transfer was started in the previous step's
+        _bookkeeping_overlap and should have completed during the current
+        step's forward execution.
+
+        Returns:
+            ModelRunnerOutput from the previous step, or None if no previous
+            output exists.
+        """
+        if self._prev_output is None:
+            return None
+
+        # Wait for the async GPU->CPU transfer to complete.
+        # This should be near-instant because the transfer overlapped with
+        # forward.
+        if self._overlap_sync_event is not None:
+            self._overlap_sync_event.synchronize()
+
+        prev = self._prev_output
+        sampled_token_ids_cpu = prev["sampled_token_ids_cpu"]
+        discard_indices = prev["discard_indices"]
+        prev_req_ids = prev["req_ids"]
+        prev_req_id_to_index = prev["req_id_to_index"]
+
+        # Convert pinned tensor to list - fast since data is already in CPU.
+        valid_sampled_token_ids = sampled_token_ids_cpu.tolist()
+
+        # Mask out discarded tokens.
+        discard_indices_set = set(discard_indices)
+        for i in discard_indices:
+            valid_sampled_token_ids[int(i)].clear()
+
+        # Update request state for sampling metadata / penalties.
+        for prev_req_idx, req_id in enumerate(prev_req_ids):
+            if prev_req_idx in discard_indices_set:
+                continue
+            sampled_ids = valid_sampled_token_ids[prev_req_idx]
+            if not sampled_ids:
+                continue
+            if req_id in self.requests:
+                req_state = self.requests[req_id]
+                req_state.output_token_ids.extend(sampled_ids)
+
+        # Get delay_max_output_token_lens for scheduler.
+        delay_max_output_token_lens = self._get_delay_max_output_token_lens()
+
+        output = ModelRunnerOutput(
+            req_ids=prev_req_ids,
+            req_id_to_index=prev_req_id_to_index,
+            sampled_token_ids=valid_sampled_token_ids,
+            logprobs=prev["logprobs_lists"],
+            prompt_logprobs_dict=prev["prompt_logprobs_dict"],
+            pooler_output=prev["pooler_output"],
+            kv_connector_output=prev["kv_connector_output"],
+            num_nans_in_logits=prev["num_nans_in_logits"],
+            delay_max_output_token_lens=delay_max_output_token_lens,
+        )
+
+        # Clear previous output.
+        self._prev_output = None
+        self._overlap_sync_event = None
+
+        return output
+
+    def _get_delay_max_output_token_lens(self) -> dict[str, int]:
+        """Get the current max output token lengths for all requests in batch.
+
+        This is used by the scheduler to set delay_max_output_token_len for
+        each request, allowing it to reserve space for tokens that will be
+        added from the current step's output.
+        """
+        result = {}
+        for req_id in self.input_batch.req_ids:
+            if req_id in self.requests:
+                # Use num_tokens which includes the current step's tokens.
+                result[req_id] = self.input_batch.num_tokens[
+                    self.input_batch.req_id_to_index[req_id]]
+        return result
+
+    def prepare_prev_output(self) -> ModelRunnerOutput:
+        """Process the previous step's deferred output for GPU/CPU overlap.
+
+        This method is called when there's no forward work to do but we need
+        to flush pending output from the previous step.
+
+        Returns:
+            ModelRunnerOutput from the previous step, or empty output if none.
+        """
+        delay_max_output_token_lens = self._get_delay_max_output_token_lens()
+
+        if self._prev_output is None:
+            # No previous output to process.
+            return ModelRunnerOutput(
+                req_ids=[],
+                req_id_to_index={},
+                sampled_token_ids=[],
+                logprobs=None,
+                prompt_logprobs_dict={},
+                pooler_output=[],
+                delay_max_output_token_lens=delay_max_output_token_lens,
+            )
+
+        # Wait for the async GPU->CPU transfer to complete.
+        if self._overlap_sync_event is not None:
+            self._overlap_sync_event.synchronize()
+
+        prev = self._prev_output
+        sampled_token_ids_cpu = prev["sampled_token_ids_cpu"]
+        discard_indices = prev["discard_indices"]
+        prev_req_ids = prev["req_ids"]
+        prev_req_id_to_index = prev["req_id_to_index"]
+
+        # Convert pinned tensor to list.
+        valid_sampled_token_ids = sampled_token_ids_cpu.tolist()
+
+        # Mask out discarded tokens.
+        discard_indices_set = set(discard_indices)
+        for i in discard_indices:
+            valid_sampled_token_ids[int(i)].clear()
+
+        # NOTE: We intentionally do NOT update `token_ids_cpu` here.
+        # In overlap mode, the next step patches the last decode token directly
+        # on GPU via `input_batch.prev_sampled_token_ids`.
+        for prev_req_idx, req_id in enumerate(prev_req_ids):
+            if prev_req_idx in discard_indices_set:
+                continue
+
+            sampled_ids = valid_sampled_token_ids[prev_req_idx]
+            if not sampled_ids:
+                continue
+
+            # Update request state for sampling metadata / penalties.
+            if req_id in self.requests:
+                req_state = self.requests[req_id]
+                req_state.output_token_ids.extend(sampled_ids)
+
+        output = ModelRunnerOutput(
+            req_ids=prev_req_ids,
+            req_id_to_index=prev_req_id_to_index,
+            sampled_token_ids=valid_sampled_token_ids,
+            logprobs=prev["logprobs_lists"],
+            prompt_logprobs_dict=prev["prompt_logprobs_dict"],
+            pooler_output=prev["pooler_output"],
+            kv_connector_output=prev["kv_connector_output"],
+            num_nans_in_logits=prev["num_nans_in_logits"],
+            delay_max_output_token_lens=delay_max_output_token_lens,
+        )
+
+        # Clear previous output.
+        self._prev_output = None
+        self._overlap_sync_event = None
+
+        return output
+
+

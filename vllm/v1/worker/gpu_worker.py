@@ -475,6 +475,10 @@ class Worker(WorkerBase):
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:
         return self.model_runner.take_draft_token_ids()
 
+    def prepare_prev_output(self) -> ModelRunnerOutput:
+        """Get the previous step's output for GPU/CPU overlap mode."""
+        return self.model_runner.prepare_prev_output()
+
     def profile(self, is_start: bool = True):
         if self.profiler is None:
             raise RuntimeError("Profiler is not enabled.")

@@ -165,6 +165,9 @@ class EngineCore:
 
         self.step_fn = (self.step if self.batch_queue is None else
                         self.step_with_batch_queue)
+                
+        # GPU/CPU overlap state: stores previous step's scheduler output
+        self._prev_scheduler_output: Optional[dict] = None
 
     def _initialize_kv_caches(
             self, vllm_config: VllmConfig) -> tuple[int, int, KVCacheConfig]:
@@ -275,11 +278,72 @@ class EngineCore:
         Returns tuple of outputs and a flag indicating whether the model
         was executed.
         """
+        import vllm.envs as envs
 
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
+            # GPU/CPU Overlap: flush any pending output from previous step.
+            if envs.VLLM_CPU_GPU_OVERLAP and self._prev_scheduler_output is not None:
+                final_output = self.model_executor.collective_rpc(
+                    "prepare_prev_output")
+                if final_output and final_output[0] and final_output[0].req_ids:
+                    engine_core_outputs = self.scheduler.update_from_output_overlap(
+                        self._prev_scheduler_output, final_output[0])
+                    self._prev_scheduler_output = None
+                    return engine_core_outputs, False
+                self._prev_scheduler_output = None
             return {}, False
+
+        if envs.VLLM_CPU_GPU_OVERLAP:
+            # GPU/CPU Overlap mode:
+            # The D2H transfer from step N overlaps with step N+1's:
+            #   schedule() + _prepare_inputs() + Forward + Sample
+            #
+            # Flow:
+            # 1. schedule() - schedule current step
+            # 2. execute_model() - returns PREVIOUS step's output
+            #    (waits for prev D2H after forward, starts async D2H for current)
+            # 3. update_from_output_overlap() - update scheduler with prev output
+
+            scheduler_output = self.scheduler.schedule()
+
+            if scheduler_output.total_num_scheduled_tokens == 0:
+                # No new work, but may have previous output to flush.
+                if self._prev_scheduler_output is not None:
+                    prev_output = self.model_executor.collective_rpc(
+                        "prepare_prev_output")
+                    if prev_output and prev_output[0] and prev_output[0].req_ids:
+                        engine_core_outputs = self.scheduler.update_from_output_overlap(
+                            self._prev_scheduler_output, prev_output[0])
+                        self._prev_scheduler_output = None
+                        return engine_core_outputs, False
+                    self._prev_scheduler_output = None
+                return {}, False
+
+            # Execute model - returns PREVIOUS step's output.
+            model_output = self.execute_model_with_error_logging(
+                self.model_executor.execute_model,  # type: ignore
+                scheduler_output)
+
+            # Update scheduler with PREVIOUS step's output.
+            engine_core_outputs = {}
+            if self._prev_scheduler_output is not None and model_output.req_ids:
+                engine_core_outputs = self.scheduler.update_from_output_overlap(
+                    self._prev_scheduler_output, model_output)
+
+            # Save current scheduler output for next step.
+            self._prev_scheduler_output = {
+                "num_scheduled_tokens": scheduler_output.num_scheduled_tokens.copy(),
+                "scheduled_spec_decode_tokens": (
+                    scheduler_output.scheduled_spec_decode_tokens.copy()
+                    if scheduler_output.scheduled_spec_decode_tokens else {}
+                ),
+            }
+
+            return (engine_core_outputs, True)
+
+        # Standard mode: sequential execution.
         scheduler_output = self.scheduler.schedule()
         model_output = self.execute_model_with_error_logging(
             self.model_executor.execute_model,  # type: ignore

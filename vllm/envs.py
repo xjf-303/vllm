@@ -206,6 +206,11 @@ if TYPE_CHECKING:
     VLLM_NCCL_INCLUDE_PATH: Optional[str] = None
     VLLM_USE_FBGEMM: bool = False
 
+    # GPU/CPU overlap: overlap CPU post-processing with GPU forward
+    # This can reduce decode latency by hiding GPU->CPU sync and CPU processing
+    VLLM_CPU_GPU_OVERLAP: bool = False
+    # Enable verbose logs for the overlap pipeline.
+    VLLM_CPU_GPU_OVERLAP_DEBUG: bool = False
 
 def get_default_cache_root():
     return os.getenv(
@@ -1476,6 +1481,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Flag to enable FBGemm kernels on model execution
     "VLLM_USE_FBGEMM": lambda: bool(int(os.getenv("VLLM_USE_FBGEMM", "0"))),
 }
+
+    # GPU/CPU overlap: overlap CPU post-processing with GPU forward
+    # This can reduce decode latency by hiding GPU->CPU sync and CPU processing
+    "VLLM_CPU_GPU_OVERLAP": lambda: bool(int(os.getenv("VLLM_CPU_GPU_OVERLAP", "0"))),
+    # Enable verbose logs for the overlap pipeline.
+    "VLLM_CPU_GPU_OVERLAP_DEBUG":
+    lambda: bool(int(os.getenv("VLLM_CPU_GPU_OVERLAP_DEBUG", "0"))),
 
 # --8<-- [end:env-vars-definition]
 
